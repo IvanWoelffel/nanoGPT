@@ -5,6 +5,8 @@ References:
 https://github.com/openai/gpt-2/blob/master/src/model.py
 2) huggingface/transformers PyTorch implementation:
 https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
+3) RoFormer for Rotary Position Embeddings:
+https://github.com/ZhuiyiTechnology/roformer
 """
 
 import math
@@ -14,6 +16,44 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+
+
+def precompute_freqs_cis(dim: int, max_seq_len: int, theta: float = 10000.0):
+    """
+    Précalcule les fréquences complexes pour RoPE.
+
+    Args:
+        dim: Dimension par tête (head_dim = n_embd // n_head)
+        max_seq_len: Longueur maximale de séquence
+        theta: Base pour les fréquences
+
+    Returns:
+        freqs_cis: Tensor (max_seq_len, dim//2, 2) avec [cos, sin] empilés
+    """
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
+    freqs = torch.outer(torch.arange(max_seq_len), freqs)
+    return torch.stack([freqs.cos(), freqs.sin()], dim=-1)
+
+
+def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+    """
+    Applique l'embedding rotatif à x.
+
+    Args:
+        x: Tensor de shape (B, n_head, T, head_dim)
+        freqs_cis: Tensor de shape (T, head_dim//2, 2)
+
+    Returns:
+        x_rotated: Tensor avec RoPE appliqué
+    """
+    x_ = x.float().reshape(*x.shape[:-1], -1, 2)
+    x0, x1 = x_[..., 0], x_[..., 1]
+    cos = freqs_cis[..., 0]
+    sin = freqs_cis[..., 1]
+    cos = cos.unsqueeze(0).unsqueeze(0)
+    sin = sin.unsqueeze(0).unsqueeze(0)
+    x_out = torch.stack([x0 * cos - x1 * sin, x0 * sin + x1 * cos], dim=-1)
+    return x_out.reshape(*x.shape).type_as(x)
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -41,6 +81,7 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
+        self.use_rope = config.use_rope
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
@@ -49,7 +90,7 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x):
+    def forward(self, x, freqs_cis=None):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -57,6 +98,11 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+        # apply RoPE if enabled
+        if self.use_rope and freqs_cis is not None:
+            q = apply_rotary_emb(q, freqs_cis)
+            k = apply_rotary_emb(k, freqs_cis)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
@@ -100,8 +146,8 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, freqs_cis=None):
+        x = x + self.attn(self.ln_1(x), freqs_cis=freqs_cis)
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -114,6 +160,8 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    use_rope: bool = False # Use Rotary Position Embeddings (RoPE) instead of absolute positional embeddings
+    rope_theta: float = 10000.0 # Base theta for RoPE frequency computation
 
 class GPT(nn.Module):
 
@@ -123,19 +171,27 @@ class GPT(nn.Module):
         assert config.block_size is not None
         self.config = config
 
-        self.transformer = nn.ModuleDict(dict(
+        transformer_dict = dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
-        ))
+        )
+        if not config.use_rope:
+            transformer_dict['wpe'] = nn.Embedding(config.block_size, config.n_embd)
+        self.transformer = nn.ModuleDict(transformer_dict)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+
+        # precompute rotary embeddings if enabled
+        if config.use_rope:
+            head_dim = config.n_embd // config.n_head
+            freqs_cis = precompute_freqs_cis(head_dim, config.block_size, config.rope_theta)
+            self.register_buffer("freqs_cis", freqs_cis, persistent=False)
 
         # init all weights
         self.apply(self._init_weights)
@@ -155,7 +211,7 @@ class GPT(nn.Module):
         params are actually used as weights in the final layer, so we include them.
         """
         n_params = sum(p.numel() for p in self.parameters())
-        if non_embedding:
+        if non_embedding and not self.config.use_rope:
             n_params -= self.transformer.wpe.weight.numel()
         return n_params
 
@@ -171,14 +227,23 @@ class GPT(nn.Module):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+
+        if self.config.use_rope:
+            # with RoPE, no positional embedding is added
+            x = self.transformer.drop(tok_emb)
+            freqs_cis = self.freqs_cis[:t]
+        else:
+            # standard absolute positional embeddings
+            pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+            pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+            x = self.transformer.drop(tok_emb + pos_emb)
+            freqs_cis = None
+
         for block in self.transformer.h:
-            x = block(x)
+            x = block(x, freqs_cis=freqs_cis)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
@@ -198,7 +263,13 @@ class GPT(nn.Module):
         # but want to use a smaller block size for some smaller, simpler model
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
-        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
+        if not self.config.use_rope:
+            self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
+        else:
+            # recompute freqs_cis for new block size
+            head_dim = self.config.n_embd // self.config.n_head
+            freqs_cis = precompute_freqs_cis(head_dim, block_size, self.config.rope_theta)
+            self.register_buffer("freqs_cis", freqs_cis, persistent=False)
         for block in self.transformer.h:
             if hasattr(block.attn, 'bias'):
                 block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]

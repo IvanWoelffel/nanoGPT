@@ -54,6 +54,9 @@ n_head = 12
 n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
+# rope (rotary position embeddings)
+use_rope = False # use rotary position embeddings instead of absolute positional embeddings
+rope_theta = 10000.0 # base theta for RoPE frequency computation
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -145,7 +148,8 @@ if os.path.exists(meta_path):
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+                  bias=bias, vocab_size=None, dropout=dropout, use_rope=use_rope,
+                  rope_theta=rope_theta) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -165,6 +169,9 @@ elif init_from == 'resume':
     # the rest of the attributes (e.g. dropout) can stay as desired from command line
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = checkpoint_model_args[k]
+    # handle RoPE parameters with defaults for old checkpoints
+    model_args['use_rope'] = checkpoint_model_args.get('use_rope', False)
+    model_args['rope_theta'] = checkpoint_model_args.get('rope_theta', 10000.0)
     # create the model
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
@@ -183,6 +190,8 @@ elif init_from.startswith('gpt2'):
     # initialize from OpenAI GPT-2 weights
     override_args = dict(dropout=dropout)
     model = GPT.from_pretrained(init_from, override_args)
+    # GPT-2 uses absolute positional embeddings, not RoPE
+    model_args['use_rope'] = False
     # read off the created config params, so we can store them into checkpoint correctly
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = getattr(model.config, k)
